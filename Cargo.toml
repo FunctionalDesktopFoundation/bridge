@@ -1,9 +1,23 @@
 [package]
-name = "trash-bridge"
-version = "0.1.0"
+name = "fdf-bridge"
 edition = "2021"
 
+[features]
+default = []
+qt = []
+
+[lib]
+name = "fdf_bridge"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bridge"
+path = "src/main.rs"
+
 [dependencies]
+serde_json = "1"
+libloading = "0.8"
+serde = { version = "1.0.228", features = ["derive"] }
 
 [build-dependencies]
 cc = "1"

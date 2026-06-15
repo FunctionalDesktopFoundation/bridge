@@ -1,5 +1,5 @@
-#ifndef TRASH_BRIDGE_H
-#define TRASH_BRIDGE_H
+#ifndef FDF_BRIDGE_H
+#define FDF_BRIDGE_H
 
 #include <QObject>
 #include <QCoreApplication>
@@ -17,6 +17,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonArray>
+#include <QJsonValue>
 #include <QDateTime>
 #include <QUrl>
 #include <QClipboard>
@@ -41,12 +42,20 @@
 #include <QSysInfo>
 #include <QFileSystemWatcher>
 
-class TrashSettings : public QObject {
+
+extern "C" {
+    int rust_ffi_has(const char *name);
+    char* rust_ffi_call(const char *name, const char *args_json);
+    void rust_ffi_free_string(char *s);
+    char* rust_ffi_list();
+}
+
+class FDFSettings : public QObject {
     Q_OBJECT
     Q_PROPERTY(QString filePath READ filePath NOTIFY filePathChanged)
 
 public:
-    explicit TrashSettings(QObject *parent = nullptr)
+    explicit FDFSettings(QObject *parent = nullptr)
         : QObject(parent), m_dirty(false), m_saveTimer(this)
     {
         QString base = QDir::homePath() + "/.fdf";
@@ -55,7 +64,7 @@ public:
         load();
         m_saveTimer.setSingleShot(true);
         m_saveTimer.setInterval(500);
-        connect(&m_saveTimer, &QTimer::timeout, this, &TrashSettings::flush);
+        connect(&m_saveTimer, &QTimer::timeout, this, &FDFSettings::flush);
     }
 
     QString filePath() const { return m_path; }
@@ -132,7 +141,7 @@ private:
     QTimer m_saveTimer;
 };
 
-class TrashPlatform : public QObject {
+class FDFPlatform : public QObject {
     Q_OBJECT
     Q_PROPERTY(QString os READ os CONSTANT)
     Q_PROPERTY(QString osVersion READ osVersion CONSTANT)
@@ -148,13 +157,13 @@ class TrashPlatform : public QObject {
     Q_PROPERTY(qreal screenRatio READ screenRatio NOTIFY screenChanged)
 
 public:
-    explicit TrashPlatform(QObject *parent = nullptr) : QObject(parent) {
+    explicit FDFPlatform(QObject *parent = nullptr) : QObject(parent) {
         m_desktop = QString::fromLocal8Bit(qgetenv("XDG_CURRENT_DESKTOP"));
         if (m_desktop.isEmpty()) m_desktop = QString::fromLocal8Bit(qgetenv("DESKTOP_SESSION"));
         m_sessionType = QString::fromLocal8Bit(qgetenv("XDG_SESSION_TYPE"));
         if (m_sessionType.isEmpty()) m_sessionType = "unknown";
-        connect(qApp, &QGuiApplication::screenAdded, this, &TrashPlatform::screenChanged);
-        connect(qApp, &QGuiApplication::screenRemoved, this, &TrashPlatform::screenChanged);
+        connect(qApp, &QGuiApplication::screenAdded, this, &FDFPlatform::screenChanged);
+        connect(qApp, &QGuiApplication::screenRemoved, this, &FDFPlatform::screenChanged);
         connect(qApp, &QGuiApplication::primaryScreenChanged, this, [this]() {
             emit screenChanged();
         });
@@ -200,14 +209,14 @@ private:
     QString m_sessionType;
 };
 
-class TrashFFI : public QObject {
+class FDFFFI : public QObject {
     Q_OBJECT
     Q_PROPERTY(QStringList functions READ functions CONSTANT)
 
 public:
     using FnPtr = std::function<QVariant(const QVariantList&)>;
 
-    explicit TrashFFI(QObject *parent = nullptr) : QObject(parent) {
+    explicit FDFFFI(QObject *parent = nullptr) : QObject(parent) {
         registerBuiltins();
     }
 
@@ -216,18 +225,31 @@ public:
     }
 
     Q_INVOKABLE QVariant call(const QString &name, const QVariantList &args = QVariantList()) {
-        if (!m_fns.contains(name)) {
-            qWarning("TrashFFI: unknown function '%s'", qPrintable(name));
-            return QVariant();
+        if (m_fns.contains(name))
+            return m_fns[name](args);
+
+
+        QByteArray nameUtf8 = name.toUtf8();
+        QJsonArray argsJson;
+        for (const auto &a : args) argsJson.append(QJsonValue::fromVariant(a));
+        QByteArray argsUtf8 = QJsonDocument(argsJson).toJson(QJsonDocument::Compact);
+
+        if (rust_ffi_has(nameUtf8.constData())) {
+            char *result = rust_ffi_call(nameUtf8.constData(), argsUtf8.constData());
+            QString resultStr = QString::fromUtf8(result);
+            rust_ffi_free_string(result);
+            return QVariant(resultStr);
         }
-        return m_fns[name](args);
+
+        qWarning("FDFFFI: unknown function '%s'", qPrintable(name));
+        return QVariant();
     }
 
     Q_INVOKABLE int callAsync(const QString &name, const QVariantList &args,
                               QJSValue onResult, QJSValue onError = QJSValue())
     {
         if (!m_fns.contains(name)) {
-            qWarning("TrashFFI: unknown async function '%s'", qPrintable(name));
+            qWarning("FDFFFI: unknown async function '%s'", qPrintable(name));
             if (onError.isCallable())
                 onError.call({QJSValue(QString("unknown function: %1").arg(name))});
             return -1;
@@ -256,7 +278,7 @@ public:
 
     Q_INVOKABLE void registerFn(const QString &name, QJSValue fn) {
         if (!fn.isCallable()) {
-            qWarning("TrashFFI: registerFn requires a callable argument");
+            qWarning("FDFFFI: registerFn requires a callable argument");
             return;
         }
         m_jsFns[name] = QJSValue(fn);
@@ -267,7 +289,7 @@ public:
             for (const auto &a : args) jsArgs.append(qvariantToJs(a));
             QJSValue result = it->call(jsArgs);
             if (result.isError()) {
-                qWarning("TrashFFI: JS fn '%s' error: %s", qPrintable(name),
+                qWarning("FDFFFI: JS fn '%s' error: %s", qPrintable(name),
                          qPrintable(result.toString()));
                 return QVariant();
             }
@@ -430,15 +452,15 @@ private:
     int m_nextAsyncId = 1;
 };
 
-class TrashClipboard : public QObject {
+class FDFClipboard : public QObject {
     Q_OBJECT
     Q_PROPERTY(QString text READ text WRITE setText NOTIFY textChanged)
     Q_PROPERTY(QString selection READ selection WRITE setSelection NOTIFY selectionChanged)
 
 public:
-    explicit TrashClipboard(QObject *parent = nullptr) : QObject(parent) {
+    explicit FDFClipboard(QObject *parent = nullptr) : QObject(parent) {
         auto *clip = QGuiApplication::clipboard();
-        connect(clip, &QClipboard::dataChanged, this, &TrashClipboard::textChanged);
+        connect(clip, &QClipboard::dataChanged, this, &FDFClipboard::textChanged);
         connect(clip, &QClipboard::selectionChanged, this, [this]() {
             emit selectionChanged();
         });
@@ -473,11 +495,11 @@ signals:
     void selectionChanged();
 };
 
-extern QString g_qmxPath;
-extern QString g_qmlOutputPath;
-extern QString g_qmlFallback;
+extern QString g_fdfQmxPath;
+extern QString g_fdfOutputPath;
+extern QString g_fdfFallback;
 
-class TrashBridge : public QObject {
+class FDFBridge : public QObject {
     Q_OBJECT
 private:
     QMap<int, QProcess*> m_processes;
@@ -486,14 +508,14 @@ private:
     QTimer *m_reloadDebounce = nullptr;
 
     void startWatchingQmx() {
-        if (m_watcher || g_qmxPath.isEmpty()) return;
-        QFileInfo fi(g_qmxPath);
+        if (m_watcher || g_fdfQmxPath.isEmpty()) return;
+        QFileInfo fi(g_fdfQmxPath);
         if (!fi.exists()) return;
         if (!fi.isWritable() && !QFileInfo(fi.absolutePath()).isWritable()) {
             return;
         }
         m_watcher = new QFileSystemWatcher(this);
-        if (!m_watcher->addPath(g_qmxPath)) {
+        if (!m_watcher->addPath(g_fdfQmxPath)) {
             delete m_watcher;
             m_watcher = nullptr;
             return;
@@ -506,19 +528,19 @@ private:
         });
         QObject::connect(m_watcher, &QFileSystemWatcher::fileChanged, this, [this](const QString &) {
             m_reloadDebounce->start();
-            if (g_qmxPath.isEmpty() || !QFileInfo::exists(g_qmxPath)) return;
-            if (!m_watcher->files().contains(g_qmxPath))
-                m_watcher->addPath(g_qmxPath);
+            if (g_fdfQmxPath.isEmpty() || !QFileInfo::exists(g_fdfQmxPath)) return;
+            if (!m_watcher->files().contains(g_fdfQmxPath))
+                m_watcher->addPath(g_fdfQmxPath);
         });
     }
 
     void doQmxTranspile() {
-        if (g_qmxPath.isEmpty() || g_qmlOutputPath.isEmpty()) return;
+        if (g_fdfQmxPath.isEmpty() || g_fdfOutputPath.isEmpty()) return;
         QProcess proc;
-        proc.start("qmx-transpile", QStringList() << g_qmxPath << g_qmlOutputPath);
+        proc.start("qmx-transpile", QStringList() << g_fdfQmxPath << g_fdfOutputPath);
         proc.waitForFinished(30000);
         if (proc.exitCode() == 0) {
-            QFileInfo fi(g_qmlOutputPath);
+            QFileInfo fi(g_fdfOutputPath);
             emit qmxReloaded(fi.lastModified().toString(Qt::ISODate));
         } else {
             QString err = QString::fromUtf8(proc.readAllStandardError());
@@ -527,8 +549,8 @@ private:
     }
 
 public:
-    TrashBridge(QObject *parent = nullptr) : QObject(parent) {
-        if (!g_qmxPath.isEmpty()) startWatchingQmx();
+    FDFBridge(QObject *parent = nullptr) : QObject(parent) {
+        if (!g_fdfQmxPath.isEmpty()) startWatchingQmx();
     }
 
     Q_INVOKABLE QString runProcessSync(const QString &command) {
@@ -548,7 +570,7 @@ public:
         return QDir::homePath();
     }
 
-    Q_INVOKABLE QString trashDir() {
+    Q_INVOKABLE QString fdfDir() {
         return QDir::homePath() + "/.fdf";
     }
 
@@ -595,7 +617,7 @@ public:
     }
 
     Q_INVOKABLE QString shellPath(const QString &name) {
-        QString base = qEnvironmentVariable("TRASH_SCRIPTS");
+        QString base = qEnvironmentVariable("FDF_SCRIPTS");
         if (base.isEmpty())
             base = QCoreApplication::applicationDirPath();
         return base + "/" + name;
@@ -623,7 +645,7 @@ public:
         QProcess *proc = new QProcess(this);
         m_processes[handle] = proc;
         QObject::connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-            this, [this, handle](int exitCode, QProcess::ExitStatus /*status*/) {
+            this, [this, handle](int exitCode, QProcess::ExitStatus ) {
             QProcess *p = m_processes.take(handle);
             if (!p) return;
             QString output = QString::fromUtf8(p->readAllStandardOutput());
@@ -769,8 +791,8 @@ public:
         startWatchingQmx();
     }
 
-    Q_INVOKABLE QString qmxPath() const { return g_qmxPath; }
-    Q_INVOKABLE QString qmxOutputPath() const { return g_qmlOutputPath; }
+    Q_INVOKABLE QString qmxPath() const { return g_fdfQmxPath; }
+    Q_INVOKABLE QString qmxOutputPath() const { return g_fdfOutputPath; }
 
 signals:
     void processFinished(int handle, const QString &output, int exitCode);
@@ -864,4 +886,4 @@ private:
     int m_nextId;
 };
 
-#endif // TRASH_BRIDGE_H
+#endif 

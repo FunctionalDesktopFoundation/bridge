@@ -26,14 +26,20 @@
             version = "0.1.0";
             src = ./.;
             cargoLock.lockFile = ./Cargo.lock;
-            nativeBuildInputs = with pkgs; [ pkg-config qt6.wrapQtAppsHook ];
-            buildInputs = qtBuildInputs;
+  
+            nativeBuildInputs = with pkgs; [ 
+              pkg-config 
+              qt6.wrapQtAppsHook 
+            ];
+  
+            buildInputs = (with pkgs.qt6; [ qtbase qtdeclarative qt5compat qtwayland ]);
+  
             doCheck = false;
             buildFeatures = [ "qt" ];
+  
             postInstall = ''
               mv $out/bin/bridge $out/bin/fdf-app
-              wrapQtApp $out/bin/fdf-app
-            '';
+             '';
           };
 
           default = self.packages.${system}.bridge;

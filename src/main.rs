@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const APP_BRIDGE_SRC: &str = env!("CARGO_MANIFEST_DIR");
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: bridge <command> [options]");
         eprintln!();
         eprintln!("Commands:");
-        eprintln!("  build       AoT transpile qmX and produce standalone executable");
+        eprintln!("  build       Compile qmX + IPC spec into a standalone executable");
         eprintln!("  bootstrap   Scaffold a new FDF application with Nix flake");
         eprintln!("  run         Run the FDF app");
         eprintln!("  ffi         List or test external FFI definitions");
@@ -63,6 +65,7 @@ fn cmd_build(args: &[String]) {
         std::process::exit(1);
     });
 
+    let app_name = input.file_stem().unwrap_or_default().to_string_lossy();
 
     println!("Transpiling {}...", input.display());
     let source = std::fs::read_to_string(&input).unwrap_or_else(|e| {
@@ -75,14 +78,12 @@ fn cmd_build(args: &[String]) {
         std::process::exit(1);
     });
 
-    let app_name = input.file_stem().unwrap_or_default().to_string_lossy();
-    let qml_output = output.join(format!("{}.qml", app_name));
+    let qml_output = output.join("shell.qml");
     std::fs::write(&qml_output, &transpiled).unwrap_or_else(|e| {
         eprintln!("Failed to write {}: {}", qml_output.display(), e);
         std::process::exit(1);
     });
     println!("  Wrote {}", qml_output.display());
-
 
     let copy_dir = |src: &Path, dst: &Path, name: &str| {
         if src.exists() {
@@ -105,29 +106,17 @@ fn cmd_build(args: &[String]) {
     copy_dir(&fdf_src, &output.join("FDF"), "FDF");
     copy_dir(&stdlib_src, &output.join("stdlib"), "stdlib");
 
-
-    if let Some(ffi) = &ffi_file {
+    let ffi_defs = if let Some(ffi) = &ffi_file {
         if ffi.exists() {
-            println!("  Processing FFI definitions from {}", ffi.display());
-            process_ffi_definitions(ffi, &output, &app_name);
-        }
-    }
+            let content = std::fs::read_to_string(ffi).unwrap_or_default();
+            serde_json::from_str::<FfiDefinition>(&content).ok()
+        } else { None }
+    } else { None };
 
-
-    let run_script = output.join("run.sh");
-    let script_content = format!(r#"#!/usr/bin/env bash
-DIR="$(cd "$(dirname "$0")" && pwd)"
-FDF_QML="$DIR/{app_name}.qml" exec "$DIR/fdf-app"
-"#);
-    std::fs::write(&run_script, script_content).ok();
-    let _ = std::process::Command::new("chmod").arg("+x").arg(&run_script).status();
-    println!("  Wrote {}", run_script.display());
-
-
-    let bridge_lib = build_bridge(&output);
-    match bridge_lib {
+    let binary = compile_app(&output, &app_name, ffi_defs.as_ref(), &transpiled);
+    match binary {
         Ok(path) => println!("  Built {}", path.display()),
-        Err(e) => eprintln!("  Bridge build skipped: {}", e),
+        Err(e) => eprintln!("  Compilation skipped: {} (the transpiled QML and assets are ready, build manually with `nix build` or `cargo build`)", e),
     }
 
     println!("Build complete. Output: {}", output.display());
@@ -145,46 +134,74 @@ struct FfiFn {
     code: String,
 }
 
-fn process_ffi_definitions(ffi_path: &Path, output: &Path, app_name: &str) {
-    let content = std::fs::read_to_string(ffi_path).unwrap_or_else(|e| {
-        eprintln!("  Error reading FFI file: {}", e);
-        std::process::exit(1);
-    });
+fn compile_app(output: &Path, app_name: &str, ffi_defs: Option<&FfiDefinition>, _transpiled_qml: &str) -> Result<PathBuf, String> {
+    let tmp_dir = std::env::temp_dir().join(format!("fdf-build-{}", app_name));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(tmp_dir.join("src")).map_err(|e| format!("failed to create temp dir: {}", e))?;
 
-    let def: FfiDefinition = serde_json::from_str(&content).unwrap_or_else(|e| {
-        eprintln!("  Error parsing FFI JSON: {}", e);
-        std::process::exit(1);
-    });
+    let cargo_toml = format!(r#"[package]
+name = "{}"
+version = "0.1.0"
+edition = "2021"
 
-    if def.fns.is_empty() {
-        println!("  No FFI functions defined");
-        return;
-    }
+[dependencies]
+fdf-bridge = {{ path = "{}", features = ["qt"] }}
+"#, app_name, APP_BRIDGE_SRC);
+    std::fs::write(tmp_dir.join("Cargo.toml"), &cargo_toml).map_err(|e| format!("failed to write Cargo.toml: {}", e))?;
 
-    let mut rs_code = String::from("// Auto-generated FFI registrations\n");
-    rs_code.push_str("use std::collections::HashMap;\n\n");
-    rs_code.push_str("pub fn register_app_fns() -> HashMap<String, Box<dyn Fn(Vec<String>) -> String + Send>> {\n");
-    rs_code.push_str("    let mut fns: HashMap<String, Box<dyn Fn(Vec<String>) -> String + Send>> = HashMap::new();\n");
-
-    for (idx, f) in def.fns.iter().enumerate() {
-        let fn_name = &f.name;
-        let fn_id = format!("_ffi_fn_{}", idx);
-        rs_code.push_str(&format!("    fns.insert(\"{}\".to_string(), Box::new(|args| -> String {{\n", fn_name));
-        rs_code.push_str("        // User-defined FFI function\n");
-        for line in f.code.lines() {
-            rs_code.push_str(&format!("        {}\n", line));
+    let mut main_rs = String::from("fn main() {\n");
+    if let Some(defs) = ffi_defs {
+        for f in &defs.fns {
+            let fn_name = &f.name;
+            main_rs.push_str(&format!("    fdf_bridge::ffi::register(\"{}\", Box::new(|args| -> String {{\n", fn_name.replace('\\', "\\\\").replace('"', "\\\"")));
+            for line in f.code.lines() {
+                main_rs.push_str(&format!("        {}\n", line));
+            }
+            main_rs.push_str("        \"ok\".to_string()\n");
+            main_rs.push_str("    }));\n");
         }
-        rs_code.push_str("        \"ok\".to_string()\n");
-        rs_code.push_str("    }));\n");
+    }
+    main_rs.push_str("    fdf_bridge::run_app();\n");
+    main_rs.push_str("}\n");
+    std::fs::write(tmp_dir.join("src/main.rs"), &main_rs).map_err(|e| format!("failed to write main.rs: {}", e))?;
+
+    let status = Command::new("cargo")
+        .args(["generate-lockfile"])
+        .current_dir(&tmp_dir)
+        .status()
+        .map_err(|e| format!("cargo not available: {}", e))?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err("cargo generate-lockfile failed".to_string());
     }
 
-    rs_code.push_str("    fns\n");
-    rs_code.push_str("}\n");
+    println!("  Compiling {}...", app_name);
+    let status = Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&tmp_dir)
+        .status()
+        .map_err(|e| format!("cargo not available: {}", e))?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err("compilation failed".to_string());
+    }
 
-    let rs_out = output.join("gen_ffi.rs");
-    std::fs::write(&rs_out, &rs_code).ok();
-    println!("  Generated {}", rs_out.display());
-    println!("  Registered {} FFI functions", def.fns.len());
+    let binary = tmp_dir.join("target/release").join(app_name);
+    if !binary.exists() {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err("binary not found after build".to_string());
+    }
+    let dest = output.join(app_name);
+    std::fs::copy(&binary, &dest).map_err(|e| format!("failed to copy binary: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    Ok(dest)
 }
 
 fn usage_bootstrap() {
@@ -219,30 +236,66 @@ fn cmd_bootstrap(args: &[String]) {
     flake-utils.url = "github:numtide/flake-utils";
     fdflib.url = "github:FunctionalDesktopFoundation/fdflib";
     stdlib.url = "github:FunctionalDesktopFoundation/stdlib";
+    bridge.url = "path:../../bridge";
   }};
-  outputs = {{ self, nixpkgs, flake-utils, fdflib, stdlib, ... }}:
+  outputs = {{ self, nixpkgs, flake-utils, fdflib, stdlib, bridge, ... }}:
     flake-utils.lib.eachDefaultSystem (system:
-      let pkgs = nixpkgs.legacyPackages.system;
+      let
+        pkgs = nixpkgs.legacyPackages.${{system}};
+        fdflibPkg = fdflib.packages.${{system}}.fdflib;
+        stdlibPkg = stdlib.packages.${{system}}.stdlib;
       in {{
-        packages.default = pkgs.stdenv.mkDerivation {{
-          name = "{}";
+        packages.default = pkgs.rustPlatform.buildRustPackage {{
+          pname = "{}";
+          version = "0.1.0";
           src = ./.;
-          buildInputs = with pkgs; [ qt6.qtbase qt6.qtdeclarative qt6.qt5compat ];
-          installPhase = ''
+          cargoLock.lockFile = ./Cargo.lock;
+
+          nativeBuildInputs = with pkgs; [
+            pkg-config qt6.qtbase qt6.wrapQtAppsHook makeWrapper
+          ];
+
+          buildInputs = with pkgs.qt6; [
+            qtbase qtdeclarative qt5compat qtwayland
+          ];
+
+          doCheck = false;
+
+          postInstall = ''
             mkdir -p $out/share/{}/FDF $out/share/{}/stdlib
             cp shell.qml $out/share/{}/shell.qml
-            cp -r ${{fdflib}}/FDF/* $out/share/{}/FDF/
-            cp -r ${{stdlib}}/stdlib/* $out/share/{}/stdlib/
-            mkdir -p $out/bin
-            echo '#!/usr/bin/env bash' > $out/bin/{}
-            echo 'TRASH_QML=$out/share/{}/shell.qml exec ${{fdflib}}/bin/fdf-app' >> $out/bin/{}
-            chmod +x $out/bin/{}
+            cp -r ${{fdflibPkg}}/FDF/*.qml $out/share/{}/FDF/
+            cp ${{fdflibPkg}}/FDF/qmldir $out/share/{}/FDF/
+            cp -r ${{stdlibPkg}}/stdlib/*.qml $out/share/{}/stdlib/
+            cp ${{stdlibPkg}}/stdlib/qmldir $out/share/{}/stdlib/
+
+            wrapProgram $out/bin/{} \
+              --set FDF_QML "$out/share/{}/shell.qml" \
+              --prefix QML2_IMPORT_PATH : "$out/share/{}"
           '';
         }};
       }});
-}}"#, app_name, app_name, app_name, app_name, app_name, app_name, app_name, app_name, app_name, app_name, app_name);
+}}"#, app_name, app_name, app_name, app_name, app_name, app_name, app_name, app_name, app_name, app_name);
     std::fs::write(out_dir.join("flake.nix"), &flake_content).ok();
     println!("  Wrote flake.nix");
+
+    let cargo_content = format!(r#"[workspace]
+
+[package]
+name = "{}"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+fdf-bridge = {{ path = "../../bridge", features = ["qt"] }}
+"#, app_name);
+    std::fs::write(out_dir.join("Cargo.toml"), &cargo_content).ok();
+    println!("  Wrote Cargo.toml");
+
+    std::fs::create_dir_all(out_dir.join("src")).ok();
+    let main_content = "fn main() {\n    fdf_bridge::run_app();\n}\n";
+    std::fs::write(out_dir.join("src/main.rs"), main_content).ok();
+    println!("  Wrote src/main.rs");
 
     let ffi_content = r#"{
   "fns": [
@@ -288,8 +341,12 @@ import stdlib
     std::fs::write(out_dir.join("shell.qmx"), &qmx_content).ok();
     println!("  Wrote shell.qmx");
 
-    // .gitignore
-    std::fs::write(out_dir.join(".gitignore"), "result\n").ok();
+    let _ = Command::new("cargo")
+        .args(["generate-lockfile"])
+        .current_dir(&out_dir)
+        .status();
+
+    std::fs::write(out_dir.join(".gitignore"), "result\ntarget\n").ok();
     println!("  Wrote .gitignore");
 
     println!();
@@ -299,8 +356,7 @@ import stdlib
     println!("  1. cd {}", out_dir.display());
     println!("  2. Edit shell.qmx to build your UI");
     println!("  3. Edit ffi.json to add external FFI functions");
-    println!("  4. bridge build --input shell.qmx --output build");
-    println!("  5. nix build  (or use the Nix flake)");
+    println!("  4. nix build  (or: bridge build --input shell.qmx --output build)");
 }
 
 fn cmd_ffi(args: &[String]) {
@@ -341,19 +397,6 @@ fn cmd_ffi(args: &[String]) {
             None => eprintln!("Function '{}' not found in FFI definitions", test_name),
         }
     }
-}
-
-fn build_bridge(_output: &Path) -> Result<PathBuf, String> {
-    let status = Command::new("cargo")
-        .args(["build", "--release", "-p", "fdf-bridge"])
-        .status()
-        .map_err(|e| format!("cargo not available: {}", e))?;
-    if !status.success() {
-        return Err("bridge build failed".to_string());
-    }
-    let target_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string()));
-    let release_lib = target_dir.parent().unwrap_or(&target_dir).join("target").join("release").join("libfdf_bridge.rlib");
-    Ok(release_lib)
 }
 
 fn cmd_run() {

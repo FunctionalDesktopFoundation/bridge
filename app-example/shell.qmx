@@ -1,0 +1,70 @@
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import QtQuick.Window
+import FDF
+import stdlib
+
+<AppWindow id="root"
+    appTitle="App Example"
+    defaultWidth={900} defaultHeight={700}
+    sidebarWidth={200}
+    showTrafficLights={true}
+    currentPage={0}
+    pages={[
+        {title: "Home", component: homePage, icon: "\uf015"},
+        {title: "About", component: aboutPage, icon: "\uf05a"}
+    ]}
+    sidebarComponent={sidebarComp}
+    @counter={0}>
+
+    def increment():
+        root.counter += 1
+
+    <Component id="sidebarComp">
+        <Sidebar highlightIndex={root.currentPage}>
+            <Repeater model={root.pages}>
+                <SidebarItem icon={modelData.icon || ""}
+                    text={modelData.title}
+                    highlighted={index === root.currentPage}
+                    onClicked={function() { root.currentPage = index }} />
+            </Repeater>
+        </Sidebar>
+    </Component>
+
+    <Component id="homePage">
+        <ContentView><ScrollView clip>
+            <ColumnLayout spacing={Theme.spMd} width={parent.width} >
+                <Item implicitHeight={Theme.sp2xl} />
+                <Label text={"Hello from FDF!"} fontPixelSize={Theme.fs2xl}
+                    color={Theme.palette.textBright} bold />
+                <NumberCounter value={root.counter} prefix={"Counter: "}
+                    fontPixelSize={Theme.fsMd} color={Theme.palette.textDim} />
+                <RowLayout spacing={Theme.spMd}>
+                    <FButton text="Increment" variant="primary"
+                        onClicked={function() { root.counter += 1 }} />
+                    <FButton text="Reset" variant="ghost"
+                        onClicked={function() { root.counter = 0 }} />
+                </RowLayout>
+                <Item implicitHeight={Theme.sp2xl} />
+            </ColumnLayout>
+        </ScrollView></ContentView>
+    </Component>
+
+    <Component id="aboutPage">
+        <ContentView><ScrollView clip>
+            <ColumnLayout spacing={Theme.spMd} width={parent.width} >
+                <Item implicitHeight={Theme.sp2xl} />
+                <Label text="About" fontPixelSize={Theme.fs2xl}
+                    color={Theme.palette.textBright} bold />
+                <Label text="Built with FDF Bridge + Qt6"
+                    fontPixelSize={Theme.fsSm} color={Theme.palette.textDim} />
+                <AnimatedLabel text={"Supports: Desktop, Windows, Android, iOS, Wasm"}
+                    fontPixelSize={Theme.fsSm} color={Theme.palette.textDim} />
+                <Item implicitHeight={Theme.sp2xl} />
+            </ColumnLayout>
+        </ScrollView></ContentView>
+    </Component>
+
+    <PageView id="pageView" anchorsFill="parent" pages={root.pages} />
+</AppWindow>

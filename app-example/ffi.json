@@ -1,0 +1,9 @@
+{
+  "fns": [
+    {
+      "name": "greet",
+      "description": "Returns a greeting for the given name",
+      "code": "let name = args.get(0).unwrap_or(&\"world\".to_string()); format!(\"Hello, {}!\", name)"
+    }
+  ]
+}

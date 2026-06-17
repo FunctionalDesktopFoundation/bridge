@@ -1,0 +1,5 @@
+[hooks.example]
+command = "fdf-example-hook"
+type = "service"
+autostart = false
+description = "Example hook that demonstrates the hooks system"

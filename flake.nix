@@ -8,7 +8,6 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        qtBuildInputs = with pkgs.qt6; [ qtbase qtdeclarative qt5compat ];
       in {
         packages = {
           bridge = pkgs.rustPlatform.buildRustPackage {
@@ -22,6 +21,18 @@
           };
 
           default = self.packages.${system}.bridge;
+        };
+
+        devShells = {
+          default = pkgs.mkShell {
+            name = "bridge-dev";
+            nativeBuildInputs = with pkgs; [
+              pkg-config cmake ninja rustc cargo
+            ];
+            buildInputs = with pkgs.qt6; [
+              qtbase qtdeclarative
+            ];
+          };
         };
       });
 }

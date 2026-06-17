@@ -1,4 +1,7 @@
 #include "fdf_bridge.h"
+#include "sharedsettings.h"
+#include "hooks_config.h"
+#include <QColor>
 #include <QProcess>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
@@ -8,10 +11,10 @@
 #include <QByteArray>
 #include <QFontDatabase>
 #include <QDirIterator>
+#include <QFile>
 #include <QFileInfo>
 #include <QStandardPaths>
 #include <QDebug>
-#include <QResource>
 
 static void loadBundledFonts(const QString &fontDir) {
     if (!QDir(fontDir).exists()) return;
@@ -29,7 +32,7 @@ static void loadBundledFonts(const QString &fontDir) {
         qDebug() << "Loaded" << loaded << "font files from" << fontDir;
 }
 
-static void loadBundledFontsFromQrc(const QString &qrcPrefix) {
+static void loadBundledFontsFromQrc() {
     QDirIterator it(":", QDir::Files, QDirIterator::Subdirectories);
     int loaded = 0;
     while (it.hasNext()) {
@@ -44,67 +47,36 @@ static void loadBundledFontsFromQrc(const QString &qrcPrefix) {
         qDebug() << "Loaded" << loaded << "font files from Qt resources";
 }
 
-QString g_fdfQmxPath;
-QString g_fdfOutputPath;
-QString g_fdfFallback;
+static void platformDetect(QQmlApplicationEngine &engine);
 
-static QString resolveQmlPath() {
-    QString qmlPath = QString::fromLocal8Bit(qgetenv("FDF_QML"));
-    if (!qmlPath.isEmpty()) {
-        QFileInfo qmlInfo(qmlPath);
-        if (qmlInfo.exists())
-            return qmlPath;
-    }
-
-
-    if (QResource::registerResource(QCoreApplication::applicationDirPath() + "/resources.rcc")) {
-        qDebug() << "Loaded bundled Qt resources";
-    }
-    QUrl qrcUrl("qrc:///shell.qml");
-    if (QFile::exists(":/shell.qml")) {
-        return "qrc:///shell.qml";
-    }
-
-
-    QString fsPath = QCoreApplication::applicationDirPath() + "/shell.qml";
-    if (QFileInfo::exists(fsPath))
-        return fsPath;
-
-
-    qmlPath = QString::fromLocal8Bit(qgetenv("FDF_QML"));
-    if (!qmlPath.isEmpty()) {
-        QFileInfo qmlInfo(qmlPath);
-        QString baseDir = qmlInfo.absolutePath();
-        QString baseName = qmlInfo.completeBaseName();
-
-        if (qmlInfo.suffix().toLower() == "qmx") {
-            g_fdfQmxPath = qmlPath;
-            QString appName = QFileInfo(baseDir).fileName();
-            QString tmpDir = QStandardPaths::writableLocation(QStandardPaths::TempLocation) + "/fdf-qmx";
-            QDir().mkpath(tmpDir);
-            g_fdfOutputPath = tmpDir + "/" + appName + "_" + baseName + ".qml";
-
-            QProcess proc;
-            proc.start("qmx-transpile", QStringList() << g_fdfQmxPath << g_fdfOutputPath);
-            proc.waitForFinished(30000);
-            if (proc.exitCode() == 0) {
-                auto copyDir = [](const QString &src, const QString &dst) {
-                    if (!QDir(src).exists()) return;
-                    QDir().mkpath(dst);
-                    QDirIterator it(src, QDir::Files, QDirIterator::NoIteratorFlags);
-                    while (it.hasNext()) {
-                        it.next();
-                        QFile::copy(it.filePath(), dst + "/" + it.fileName());
-                    }
-                };
-                copyDir(baseDir + "/FDF", tmpDir + "/FDF");
-                copyDir(baseDir + "/stdlib", tmpDir + "/stdlib");
-                return g_fdfOutputPath;
+static QUrl resolveQmlUrl(QQmlApplicationEngine &engine) {
+    QString fdfQml = QString::fromLocal8Bit(qgetenv("FDF_QML"));
+    if (!fdfQml.isEmpty()) {
+        QFileInfo fi(fdfQml);
+        if (fi.exists()) {
+            QString baseDir = fi.absolutePath();
+            for (const auto &path : {baseDir + "/FDF", baseDir + "/stdlib", baseDir}) {
+                if (QDir(path).exists())
+                    engine.addImportPath(path);
             }
+            return QUrl::fromLocalFile(fdfQml);
         }
     }
-
-    return fsPath;
+    if (QFile::exists(":/shell.qml")) {
+        engine.addImportPath("qrc:///");
+        return QUrl("qrc:///shell.qml");
+    }
+    QString fsPath = QCoreApplication::applicationDirPath() + "/shell.qml";
+    if (QFileInfo::exists(fsPath)) {
+        QString baseDir = QFileInfo(fsPath).absolutePath();
+        for (const auto &path : {baseDir + "/FDF", baseDir + "/stdlib", baseDir}) {
+            if (QDir(path).exists())
+                engine.addImportPath(path);
+        }
+        return QUrl::fromLocalFile(fsPath);
+    }
+    engine.addImportPath("qrc:///");
+    return QUrl("qrc:///shell.qml");
 }
 
 extern "C" int run_fdf_app(void) {
@@ -112,23 +84,10 @@ extern "C" int run_fdf_app(void) {
     char *argv[2] = { const_cast<char*>("fdf-app"), nullptr };
     QGuiApplication app(argc, argv);
 
-    QString qmlPath = resolveQmlPath();
-    bool usingQrc = qmlPath.startsWith("qrc://");
-
     QQmlApplicationEngine engine;
 
-
-    engine.addImportPath("qrc:///");
-
-
-    if (!usingQrc) {
-        QFileInfo qmlInfo(qmlPath);
-        QString appShareDir = qmlInfo.absolutePath();
-        engine.addImportPath(appShareDir);
-        loadBundledFonts(appShareDir + "/fonts");
-    } else {
-        loadBundledFontsFromQrc("qrc:///fonts");
-    }
+    loadBundledFontsFromQrc();
+    loadBundledFonts(QCoreApplication::applicationDirPath() + "/fonts");
 
     FDFBridge bridge;
     engine.rootContext()->setContextProperty("bridge", &bridge);
@@ -148,7 +107,18 @@ extern "C" int run_fdf_app(void) {
     FDFIPC ipc;
     engine.rootContext()->setContextProperty("FDFIPC", &ipc);
 
-    QUrl url = usingQrc ? QUrl(qmlPath) : QUrl::fromLocalFile(qmlPath);
+    FDFHooks hooks(g_hooks, g_hookCount);
+    engine.rootContext()->setContextProperty("FDFHooks", &hooks);
+
+    platformDetect(engine);
+
+    SharedSettings sharedSettings;
+    engine.rootContext()->setContextProperty("SharedSettings", &sharedSettings);
+    engine.rootContext()->setContextProperty("FDF_DARK_MODE", sharedSettings.darkMode());
+    engine.rootContext()->setContextProperty("FDF_ACCENT_COLOR", sharedSettings.accentColor());
+    engine.rootContext()->setContextProperty("FDF_THEME_NAME", sharedSettings.themeName());
+
+    QUrl url = resolveQmlUrl(engine);
     QObject::connect(&engine, &QQmlApplicationEngine::objectCreationFailed,
         &app, [&]() {
         qWarning("Failed to load QML: %s", qPrintable(url.toString()));
@@ -157,4 +127,23 @@ extern "C" int run_fdf_app(void) {
 
     engine.load(url);
     return app.exec();
+}
+
+static void platformDetect(QQmlApplicationEngine &engine) {
+#if defined(Q_OS_WIN)
+    engine.rootContext()->setContextProperty("FDF_IS_MOBILE", false);
+    engine.rootContext()->setContextProperty("FDF_HAVE_WINDOW_CONTROLS", false);
+    engine.rootContext()->setContextProperty("FDF_PLATFORM", "windows");
+    engine.rootContext()->setContextProperty("FDF_TOUCH_TARGET", 32);
+#elif defined(Q_OS_MACOS)
+    engine.rootContext()->setContextProperty("FDF_IS_MOBILE", false);
+    engine.rootContext()->setContextProperty("FDF_HAVE_WINDOW_CONTROLS", false);
+    engine.rootContext()->setContextProperty("FDF_PLATFORM", "macos");
+    engine.rootContext()->setContextProperty("FDF_TOUCH_TARGET", 32);
+#else
+    engine.rootContext()->setContextProperty("FDF_IS_MOBILE", false);
+    engine.rootContext()->setContextProperty("FDF_HAVE_WINDOW_CONTROLS", true);
+    engine.rootContext()->setContextProperty("FDF_PLATFORM", "desktop");
+    engine.rootContext()->setContextProperty("FDF_TOUCH_TARGET", 32);
+#endif
 }

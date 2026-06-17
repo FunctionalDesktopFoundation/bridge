@@ -42,7 +42,6 @@
 #include <QSysInfo>
 #include <QFileSystemWatcher>
 
-
 extern "C" {
     int rust_ffi_has(const char *name);
     char* rust_ffi_call(const char *name, const char *args_json);
@@ -227,7 +226,6 @@ public:
     Q_INVOKABLE QVariant call(const QString &name, const QVariantList &args = QVariantList()) {
         if (m_fns.contains(name))
             return m_fns[name](args);
-
 
         QByteArray nameUtf8 = name.toUtf8();
         QJsonArray argsJson;
@@ -495,63 +493,14 @@ signals:
     void selectionChanged();
 };
 
-extern QString g_fdfQmxPath;
-extern QString g_fdfOutputPath;
-extern QString g_fdfFallback;
-
 class FDFBridge : public QObject {
     Q_OBJECT
 private:
     QMap<int, QProcess*> m_processes;
     int m_nextHandle = 1;
-    QFileSystemWatcher *m_watcher = nullptr;
-    QTimer *m_reloadDebounce = nullptr;
-
-    void startWatchingQmx() {
-        if (m_watcher || g_fdfQmxPath.isEmpty()) return;
-        QFileInfo fi(g_fdfQmxPath);
-        if (!fi.exists()) return;
-        if (!fi.isWritable() && !QFileInfo(fi.absolutePath()).isWritable()) {
-            return;
-        }
-        m_watcher = new QFileSystemWatcher(this);
-        if (!m_watcher->addPath(g_fdfQmxPath)) {
-            delete m_watcher;
-            m_watcher = nullptr;
-            return;
-        }
-        m_reloadDebounce = new QTimer(this);
-        m_reloadDebounce->setSingleShot(true);
-        m_reloadDebounce->setInterval(300);
-        QObject::connect(m_reloadDebounce, &QTimer::timeout, this, [this]() {
-            doQmxTranspile();
-        });
-        QObject::connect(m_watcher, &QFileSystemWatcher::fileChanged, this, [this](const QString &) {
-            m_reloadDebounce->start();
-            if (g_fdfQmxPath.isEmpty() || !QFileInfo::exists(g_fdfQmxPath)) return;
-            if (!m_watcher->files().contains(g_fdfQmxPath))
-                m_watcher->addPath(g_fdfQmxPath);
-        });
-    }
-
-    void doQmxTranspile() {
-        if (g_fdfQmxPath.isEmpty() || g_fdfOutputPath.isEmpty()) return;
-        QProcess proc;
-        proc.start("qmx-transpile", QStringList() << g_fdfQmxPath << g_fdfOutputPath);
-        proc.waitForFinished(30000);
-        if (proc.exitCode() == 0) {
-            QFileInfo fi(g_fdfOutputPath);
-            emit qmxReloaded(fi.lastModified().toString(Qt::ISODate));
-        } else {
-            QString err = QString::fromUtf8(proc.readAllStandardError());
-            emit qmxError(err);
-        }
-    }
 
 public:
-    FDFBridge(QObject *parent = nullptr) : QObject(parent) {
-        if (!g_fdfQmxPath.isEmpty()) startWatchingQmx();
-    }
+    FDFBridge(QObject *parent = nullptr) : QObject(parent) {}
 
     Q_INVOKABLE QString runProcessSync(const QString &command) {
         QProcess proc;
@@ -782,25 +731,9 @@ public:
         return results;
     }
 
-    Q_INVOKABLE bool qmxReload() {
-        doQmxTranspile();
-        return true;
-    }
-
-    Q_INVOKABLE void qmxWatch() {
-        startWatchingQmx();
-    }
-
-    Q_INVOKABLE QString qmxPath() const { return g_fdfQmxPath; }
-    Q_INVOKABLE QString qmxOutputPath() const { return g_fdfOutputPath; }
-
 signals:
     void processFinished(int handle, const QString &output, int exitCode);
-    void qmxReloaded(const QString &timestamp);
-    void qmxError(const QString &message);
 };
-
-class FDFIPC;
 
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -886,4 +819,201 @@ private:
     int m_nextId;
 };
 
-#endif 
+struct HookEntry {
+    const char *name;
+    const char *command;
+    bool autostart;
+    int timeout_ms;
+};
+
+class FDFHooks : public QObject {
+    Q_OBJECT
+    Q_PROPERTY(QStringList running READ running NOTIFY runningChanged)
+
+public:
+    explicit FDFHooks(const HookEntry *entries, int count, QObject *parent = nullptr)
+        : QObject(parent), m_entries(entries), m_count(count)
+    {
+        for (int i = 0; i < m_count; i++) {
+            if (m_entries[i].autostart)
+                startHook(i);
+        }
+    }
+
+    QStringList running() const {
+        QStringList names;
+        for (auto it = m_processes.begin(); it != m_processes.end(); ++it)
+            names.append(it.value().name);
+        return names;
+    }
+
+    Q_INVOKABLE int start(const QString &name, const QVariantMap &args = QVariantMap()) {
+        for (int i = 0; i < m_count; i++) {
+            if (m_entries[i].name == name) {
+                auto it = m_processes.begin();
+                while (it != m_processes.end()) {
+                    if (it.value().name == name) {
+                        if (it.value().proc->state() == QProcess::Running)
+                            return it.key();
+                        it = m_processes.erase(it);
+                        continue;
+                    }
+                    ++it;
+                }
+                return startHook(i, args);
+            }
+        }
+        qWarning("FDFHooks: unknown hook '%s'", qPrintable(name));
+        return -1;
+    }
+
+    Q_INVOKABLE void stop(int handle) {
+        auto it = m_processes.find(handle);
+        if (it != m_processes.end()) {
+            it.value().proc->terminate();
+            if (!it.value().proc->waitForFinished(3000))
+                it.value().proc->kill();
+        }
+    }
+
+    Q_INVOKABLE void stopAll() {
+        for (auto it = m_processes.begin(); it != m_processes.end(); ++it) {
+            it.value().proc->terminate();
+        }
+        for (auto it = m_processes.begin(); it != m_processes.end(); ++it) {
+            if (!it.value().proc->waitForFinished(3000))
+                it.value().proc->kill();
+        }
+        m_processes.clear();
+        emit runningChanged();
+    }
+
+    Q_INVOKABLE QVariant call(int handle, const QString &method, const QVariantList &args = QVariantList()) {
+        auto it = m_processes.find(handle);
+        if (it == m_processes.end()) return QVariant();
+
+        QJsonObject msg;
+        msg["method"] = method;
+        QJsonArray arr;
+        for (const auto &a : args)
+            arr.append(QJsonValue::fromVariant(a));
+        msg["args"] = arr;
+        msg["id"] = m_nextMsgId++;
+
+        QByteArray payload = QJsonDocument(msg).toJson(QJsonDocument::Compact) + "\n";
+        it.value().proc->write(payload);
+
+        if (it.value().proc->waitForBytesWritten(1000)) {
+            if (it.value().proc->waitForReadyRead(m_entries[findIndex(it.value().name)].timeout_ms)) {
+                QByteArray resp = it.value().proc->readAll();
+                QJsonParseError err;
+                QJsonDocument doc = QJsonDocument::fromJson(resp, &err);
+                if (err.error == QJsonParseError::NoError && doc.isObject())
+                    return doc.object()["result"].toVariant();
+            }
+        }
+        return QVariant();
+    }
+
+    Q_INVOKABLE void send(int handle, const QString &method, const QVariantList &args = QVariantList()) {
+        auto it = m_processes.find(handle);
+        if (it == m_processes.end()) return;
+
+        QJsonObject msg;
+        msg["method"] = method;
+        QJsonArray arr;
+        for (const auto &a : args)
+            arr.append(QJsonValue::fromVariant(a));
+        msg["args"] = arr;
+
+        QByteArray payload = QJsonDocument(msg).toJson(QJsonDocument::Compact) + "\n";
+        it.value().proc->write(payload);
+        it.value().proc->waitForBytesWritten(1000);
+    }
+
+    Q_INVOKABLE bool isRunning(int handle) const {
+        auto it = m_processes.find(handle);
+        return it != m_processes.end() && it.value().proc->state() == QProcess::Running;
+    }
+
+    Q_INVOKABLE int handleFor(const QString &name) const {
+        for (auto it = m_processes.begin(); it != m_processes.end(); ++it) {
+            if (it.value().name == name) return it.key();
+        }
+        return -1;
+    }
+
+    Q_INVOKABLE QStringList list() const {
+        QStringList names;
+        for (int i = 0; i < m_count; i++)
+            names.append(m_entries[i].name);
+        return names;
+    }
+
+signals:
+    void hookOutput(int handle, const QString &name, const QString &data);
+    void hookExited(int handle, const QString &name, int exitCode);
+    void runningChanged();
+
+private:
+    struct HookProcess {
+        QString name;
+        QProcess *proc;
+    };
+
+    int findIndex(const QString &name) const {
+        for (int i = 0; i < m_count; i++)
+            if (m_entries[i].name == name) return i;
+        return -1;
+    }
+
+    int startHook(int idx, const QVariantMap &args = QVariantMap()) {
+        if (idx < 0 || idx >= m_count) return -1;
+
+        QProcess *proc = new QProcess(this);
+        QString cmd = m_entries[idx].command;
+        QStringList procArgs;
+        if (!args.isEmpty()) {
+            QJsonObject a = QJsonObject::fromVariantMap(args);
+            procArgs << "--args" << QString::fromUtf8(QJsonDocument(a).toJson(QJsonDocument::Compact));
+        }
+
+        int handle = m_nextHandle++;
+        HookProcess hp;
+        hp.name = m_entries[idx].name;
+        hp.proc = proc;
+        m_processes[handle] = hp;
+
+        QObject::connect(proc, &QProcess::readyReadStandardOutput, this, [this, handle, proc]() {
+            QString data = QString::fromUtf8(proc->readAllStandardOutput());
+            if (!data.isEmpty()) {
+                auto it = m_processes.find(handle);
+                emit hookOutput(handle, it != m_processes.end() ? it.value().name : "", data);
+            }
+        });
+
+        QObject::connect(proc, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+            this, [this, handle](int exitCode, QProcess::ExitStatus) {
+            QString name;
+            auto it = m_processes.find(handle);
+            if (it != m_processes.end()) {
+                name = it.value().name;
+                m_processes.erase(it);
+            }
+            emit hookExited(handle, name, exitCode);
+            emit runningChanged();
+        });
+
+        proc->start(cmd, procArgs);
+        emit runningChanged();
+        return handle;
+    }
+
+    const HookEntry *m_entries;
+    int m_count;
+    QMap<int, HookProcess> m_processes;
+    int m_nextHandle = 1;
+    int m_nextMsgId = 1;
+};
+
+#endif

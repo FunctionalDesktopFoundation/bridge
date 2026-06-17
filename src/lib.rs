@@ -1,5 +1,6 @@
 pub mod transpile;
 pub mod ffi;
+pub mod hooks;
 
 #[cfg(feature = "qt")]
 extern "C" {

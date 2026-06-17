@@ -1,0 +1,27 @@
+{
+  "name": "app-example",
+  "target": "desktop",
+  "features": {
+    "windowControls": true,
+    "ipc": true,
+    "ffi": true
+  },
+  "android": {
+    "packageName": "org.fdf.appexample",
+    "sharedUserId": "com.fdf.shared_settings_group",
+    "minSdk": 21,
+    "targetSdk": 33,
+    "buildDir": "build-android"
+  },
+  "ios": {
+    "bundleId": "org.fdf.appexample",
+    "deploymentTarget": "15.0",
+    "buildDir": "build-ios"
+  },
+  "windows": {
+    "buildDir": "build-windows"
+  },
+  "wasm": {
+    "buildDir": "build-wasm"
+  }
+}
